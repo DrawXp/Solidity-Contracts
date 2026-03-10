@@ -1,0 +1,376 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.33;
+
+interface IERC20 {
+  function transfer(address to, uint256 amount) external returns (bool);
+  function transferFrom(address from, address to, uint256 amount) external returns (bool);
+  function balanceOf(address account) external view returns (uint256);
+}
+
+library SafeERC20 {
+  error ERC20CallFailed();
+
+  function safeTransfer(IERC20 token, address to, uint256 amount) internal {
+    (bool ok, bytes memory data) = address(token).call(
+      abi.encodeWithSelector(token.transfer.selector, to, amount)
+    );
+    if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+  }
+
+  function safeTransferFrom(IERC20 token, address from, address to, uint256 amount) internal {
+    (bool ok, bytes memory data) = address(token).call(
+      abi.encodeWithSelector(token.transferFrom.selector, from, to, amount)
+    );
+    if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert ERC20CallFailed();
+  }
+}
+
+abstract contract ReentrancyGuard {
+  error Reentrancy();
+  uint256 private _lock = 1;
+
+  modifier nonReentrant() {
+    if (_lock != 1) revert Reentrancy();
+    _lock = 2;
+    _;
+    _lock = 1;
+  }
+}
+
+contract TMTripleVault is ReentrancyGuard {
+  using SafeERC20 for IERC20;
+
+  error NotOwner();
+  error Paused();
+  error ZeroAddress();
+  error InvalidVault();
+  error ZeroAmount();
+  error Locked(uint40 until);
+  error InsufficientShares();
+  error FeeTooHigh();
+  error BpsInvalid();
+  error ThirdPartyDepositNotAllowed();
+  error RescueUSDCNotAllowed();
+  error NoExcess();
+  error FeesNotClaimable();
+
+  event Deposit(uint8 indexed vaultId, address indexed caller, address indexed receiver, uint256 assets, uint256 shares, uint40 unlockTime);
+  event Withdraw(uint8 indexed vaultId, address indexed owner, address indexed receiver, uint256 assets, uint256 shares, uint256 fee, uint256 netOut);
+  event ExcessSwept(address indexed to, uint256 amount);
+  event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+  event PausedSet(bool paused);
+
+  uint16 public constant BPS_DENOM = 10_000;
+  uint16 public constant MAX_FEE_BPS = 1_000;
+
+  uint8 public constant VAULT_STABLE = 0;
+  uint8 public constant VAULT_GROWTH = 1;
+  uint8 public constant VAULT_TURBO  = 2;
+
+  IERC20 public immutable USDC;
+
+  address public owner;
+  bool public paused;
+
+  struct Position {
+    uint256 s0;
+    uint256 s1;
+    uint256 s2;
+    uint40 u0;
+    uint40 u1;
+    uint40 u2;
+  }
+
+  mapping(address => Position) private _pos;
+
+  uint256[3] private _totalShares;
+  uint256[3] private _totalAssets;
+
+  uint16[3] private _depFeeBps;
+
+  uint16[3] private _feeSplitBps;
+
+  uint40[3] private _feeWindowStart;
+  uint256[3] private _feeWindowAcc;
+
+  uint256[3] private _feeAccrued;
+
+  modifier onlyOwner() {
+    if (msg.sender != owner) revert NotOwner();
+    _;
+  }
+
+  constructor(address usdc_, address owner_) {
+    if (usdc_ == address(0) || owner_ == address(0)) revert ZeroAddress();
+    USDC = IERC20(usdc_);
+    owner = owner_;
+    emit OwnershipTransferred(address(0), owner_);
+
+    _depFeeBps = [uint16(50), uint16(125), uint16(325)];
+    _feeSplitBps = [uint16(1000), uint16(2500), uint16(6500)];
+  }
+
+  function setPaused(bool v) external onlyOwner {
+    paused = v;
+    emit PausedSet(v);
+  }
+
+  function transferOwnership(address newOwner) external onlyOwner {
+    if (newOwner == address(0)) revert ZeroAddress();
+    address prev = owner;
+    owner = newOwner;
+    emit OwnershipTransferred(prev, newOwner);
+  }
+
+  function setDepositFees(uint16 stableDep, uint16 growthDep, uint16 turboDep) external onlyOwner {
+    if (stableDep > MAX_FEE_BPS || growthDep > MAX_FEE_BPS || turboDep > MAX_FEE_BPS) revert FeeTooHigh();
+    _depFeeBps = [stableDep, growthDep, turboDep];
+  }
+
+  function setFeeSplit(uint16 stableBps, uint16 growthBps, uint16 turboBps) external onlyOwner {
+    uint256 sum = uint256(stableBps) + uint256(growthBps) + uint256(turboBps);
+    if (sum != BPS_DENOM) revert BpsInvalid();
+    _feeSplitBps = [stableBps, growthBps, turboBps];
+  }
+
+  function lockupSeconds(uint8 vaultId) public pure returns (uint32) {
+    if (vaultId > 2) revert InvalidVault();
+    return 86_400;
+  }
+
+  function depositFeeBps(uint8 vaultId) public view returns (uint16) {
+    if (vaultId > 2) revert InvalidVault();
+    return _depFeeBps[vaultId];
+  }
+
+  function withdrawFeeBps(uint8 vaultId) public pure returns (uint16) {
+    if (vaultId > 2) revert InvalidVault();
+    return 0;
+  }
+
+  function feeBps(uint8 vaultId) public view returns (uint16) {
+    return depositFeeBps(vaultId);
+  }
+
+  function vaultCount() external pure returns (uint8) {
+    return 3;
+  }
+
+  function feeAccrued(uint8 vaultId) external view returns (uint256) {
+    if (vaultId > 2) revert InvalidVault();
+    return _feeAccrued[vaultId];
+  }
+
+  function feeSplitBps() external view returns (uint16 stableBps, uint16 growthBps, uint16 turboBps) {
+    stableBps = _feeSplitBps[0];
+    growthBps = _feeSplitBps[1];
+    turboBps  = _feeSplitBps[2];
+  }
+
+  function totalShares(uint8 vaultId) external view returns (uint256) {
+    if (vaultId > 2) revert InvalidVault();
+    return _totalShares[vaultId];
+  }
+
+  function totalAssets(uint8 vaultId) external view returns (uint256) {
+    if (vaultId > 2) revert InvalidVault();
+    return _totalAssets[vaultId];
+  }
+
+  function totalRequiredBalance() public view returns (uint256) {
+    return _totalAssets[0] + _totalAssets[1] + _totalAssets[2];
+  }
+
+  function position(uint8 vaultId, address user) external view returns (uint256 shares, uint40 unlockTime_) {
+    if (vaultId > 2) revert InvalidVault();
+    Position storage p = _pos[user];
+    if (vaultId == 0) { shares = p.s0; unlockTime_ = p.u0; }
+    else if (vaultId == 1) { shares = p.s1; unlockTime_ = p.u1; }
+    else { shares = p.s2; unlockTime_ = p.u2; }
+  }
+
+  function convertToShares(uint8 vaultId, uint256 assets) public view returns (uint256 shares) {
+    if (vaultId > 2) revert InvalidVault();
+    uint256 ts = _totalShares[vaultId];
+    uint256 ta = _totalAssets[vaultId];
+    if (assets == 0) return 0;
+    if (ts == 0 || ta == 0) return assets;
+    shares = (assets * ts) / ta;
+  }
+
+  function convertToSharesUp(uint8 vaultId, uint256 assets) public view returns (uint256 shares) {
+    if (vaultId > 2) revert InvalidVault();
+    uint256 ts = _totalShares[vaultId];
+    uint256 ta = _totalAssets[vaultId];
+    if (assets == 0) return 0;
+    if (ts == 0 || ta == 0) return assets;
+    shares = (assets * ts + ta - 1) / ta;
+  }
+
+  function convertToAssets(uint8 vaultId, uint256 shares) public view returns (uint256 assets) {
+    if (vaultId > 2) revert InvalidVault();
+    uint256 ts = _totalShares[vaultId];
+    uint256 ta = _totalAssets[vaultId];
+    if (shares == 0) return 0;
+    if (ts == 0 || ta == 0) return shares;
+    assets = (shares * ta) / ts;
+  }
+
+  function previewDeposit(uint8 vaultId, uint256 assets) external view returns (uint256 shares) {
+    uint256 fee = (assets * uint256(depositFeeBps(vaultId))) / BPS_DENOM;
+    uint256 net = assets - fee;
+    shares = convertToShares(vaultId, net);
+    if (shares == 0) revert ZeroAmount();
+  }
+
+  function previewWithdraw(uint8 vaultId, uint256 assets) external pure returns (uint256 netOut, uint256 fee) {
+    if (vaultId > 2) revert InvalidVault();
+    fee = 0;
+    netOut = assets;
+  }
+
+  function apyBps(uint8 vaultId) external view returns (uint256 bps) {
+    if (vaultId > 2) revert InvalidVault();
+    uint40 s = _feeWindowStart[vaultId];
+    uint256 a = _feeWindowAcc[vaultId];
+    uint256 ta = _totalAssets[vaultId];
+    if (a == 0 || ta == 0 || s == 0) return 0;
+    uint256 elapsed = block.timestamp > s ? (block.timestamp - s) : 0;
+    if (elapsed == 0) return 0;
+    if (elapsed > 86_400) elapsed = 86_400;
+    bps = (a * 365 days * BPS_DENOM) / (ta * elapsed);
+  }
+
+  function _bumpFeeWindow(uint8 vaultId, uint256 amount) internal {
+    uint40 s = _feeWindowStart[vaultId];
+    if (s == 0 || block.timestamp - s >= 86_400) {
+      _feeWindowStart[vaultId] = uint40(block.timestamp);
+      _feeWindowAcc[vaultId] = amount;
+    } else {
+      _feeWindowAcc[vaultId] += amount;
+    }
+  }
+
+  function _distributeFee(uint256 feeAmount) internal {
+    if (feeAmount == 0) return;
+    uint256 a0 = (feeAmount * uint256(_feeSplitBps[0])) / BPS_DENOM;
+    uint256 a1 = (feeAmount * uint256(_feeSplitBps[1])) / BPS_DENOM;
+    uint256 a2 = feeAmount - a0 - a1;
+
+    _totalAssets[0] += a0;
+    _totalAssets[1] += a1;
+    _totalAssets[2] += a2;
+
+    _bumpFeeWindow(0, a0);
+    _bumpFeeWindow(1, a1);
+    _bumpFeeWindow(2, a2);
+  }
+
+  function deposit(uint8 vaultId, uint256 assets, address receiver) external nonReentrant returns (uint256 shares) {
+    if (paused) revert Paused();
+    if (vaultId > 2) revert InvalidVault();
+    if (receiver == address(0)) revert ZeroAddress();
+    if (assets == 0) revert ZeroAmount();
+    if (receiver != msg.sender) revert ThirdPartyDepositNotAllowed();
+
+    uint256 fee = (assets * uint256(depositFeeBps(vaultId))) / BPS_DENOM;
+    uint256 net = assets - fee;
+
+    USDC.safeTransferFrom(msg.sender, address(this), assets);
+
+    shares = convertToShares(vaultId, net);
+    if (shares == 0) revert ZeroAmount();
+
+    _totalShares[vaultId] += shares;
+    _totalAssets[vaultId] += net;
+
+    uint40 requiredUnlock = uint40(block.timestamp + lockupSeconds(vaultId));
+    Position storage p = _pos[receiver];
+
+    if (vaultId == 0) {
+      p.s0 += shares;
+      uint40 u0 = p.u0;
+      if (requiredUnlock > u0) { u0 = requiredUnlock; p.u0 = u0; }
+      emit Deposit(vaultId, msg.sender, receiver, assets, shares, u0);
+    } else if (vaultId == 1) {
+      p.s1 += shares;
+      uint40 u1 = p.u1;
+      if (requiredUnlock > u1) { u1 = requiredUnlock; p.u1 = u1; }
+      emit Deposit(vaultId, msg.sender, receiver, assets, shares, u1);
+    } else {
+      p.s2 += shares;
+      uint40 u2 = p.u2;
+      if (requiredUnlock > u2) { u2 = requiredUnlock; p.u2 = u2; }
+      emit Deposit(vaultId, msg.sender, receiver, assets, shares, u2);
+    }
+
+    _feeAccrued[vaultId] += fee;
+    _distributeFee(fee);
+  }
+
+  function withdraw(uint8 vaultId, uint256 assets, address receiver)
+    external
+    nonReentrant
+    returns (uint256 sharesBurned, uint256 fee, uint256 netOut)
+  {
+    if (vaultId > 2) revert InvalidVault();
+    if (receiver == address(0)) revert ZeroAddress();
+    if (assets == 0) revert ZeroAmount();
+
+    Position storage p = _pos[msg.sender];
+
+    uint40 until;
+    uint256 bal;
+
+    if (vaultId == 0) { until = p.u0; bal = p.s0; }
+    else if (vaultId == 1) { until = p.u1; bal = p.s1; }
+    else { until = p.u2; bal = p.s2; }
+
+    if (block.timestamp < until) revert Locked(until);
+
+    uint256 ta = _totalAssets[vaultId];
+    if (assets > ta) revert InsufficientShares();
+
+    sharesBurned = convertToSharesUp(vaultId, assets);
+    if (sharesBurned == 0 || sharesBurned > bal) revert InsufficientShares();
+
+    _totalShares[vaultId] -= sharesBurned;
+    _totalAssets[vaultId] -= assets;
+
+    if (vaultId == 0) p.s0 = bal - sharesBurned;
+    else if (vaultId == 1) p.s1 = bal - sharesBurned;
+    else p.s2 = bal - sharesBurned;
+
+    fee = 0;
+    netOut = assets;
+
+    USDC.safeTransfer(receiver, netOut);
+
+    emit Withdraw(vaultId, msg.sender, receiver, assets, sharesBurned, fee, netOut);
+  }
+
+  function claimFees(uint8, address, uint256) external pure {
+    revert FeesNotClaimable();
+  }
+
+  function claimAllFees(uint8, address) external pure {
+    revert FeesNotClaimable();
+  }
+
+  function sweepExcess(address to) external onlyOwner nonReentrant {
+    if (to == address(0)) revert ZeroAddress();
+    uint256 required = totalRequiredBalance();
+    uint256 bal = USDC.balanceOf(address(this));
+    if (bal <= required) revert NoExcess();
+    uint256 amt = bal - required;
+    USDC.safeTransfer(to, amt);
+    emit ExcessSwept(to, amt);
+  }
+
+  function rescueToken(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+    if (token == address(0) || to == address(0)) revert ZeroAddress();
+    if (amount == 0) revert ZeroAmount();
+    if (token == address(USDC)) revert RescueUSDCNotAllowed();
+    IERC20(token).safeTransfer(to, amount);
+  }
+}
